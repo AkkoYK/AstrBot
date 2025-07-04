@@ -40,10 +40,8 @@ SUPPORTED_TYPES = [
 
 
 @dataclass
-class FuncTool:
-    """
-    用于描述一个函数调用工具。
-    """
+class FunctionTool:
+    """A class representing a function tool that can be used in function calling."""
 
     name: str
     parameters: Dict
@@ -70,24 +68,190 @@ class FuncTool:
     def __repr__(self):
         return f"FuncTool(name={self.name}, parameters={self.parameters}, description={self.description}, active={self.active}, origin={self.origin})"
 
-    async def execute(self, **args) -> Any:
-        """执行函数调用"""
-        if self.origin == "local":
-            if not self.handler:
-                raise Exception(f"Local function {self.name} has no handler")
-            return await self.handler(**args)
-        elif self.origin == "mcp":
-            if not self.mcp_client or not self.mcp_client.session:
-                raise Exception(f"MCP client for {self.name} is not available")
-            # 使用name属性而不是额外的mcp_tool_name
-            if ":" in self.name:
-                # 如果名字是格式为 mcp:server:tool_name，提取实际的工具名
-                actual_tool_name = self.name.split(":")[-1]
-                return await self.mcp_client.session.call_tool(actual_tool_name, args)
+
+# alias for FunctionTool
+FuncTool = FunctionTool
+
+
+class ToolSet:
+    """A set of function tools that can be used in function calling.
+
+    This class provides methods to add, remove, and retrieve tools, as well as
+    convert the tools to different API formats (OpenAI, Anthropic, Google GenAI)."""
+
+    def __init__(self, tools: List[FunctionTool] = None):
+        self.tools: List[FunctionTool] = tools or []
+
+    def add_tool(self, tool: FunctionTool):
+        """Add a tool to the set."""
+        # 检查是否已存在同名工具
+        for i, existing_tool in enumerate(self.tools):
+            if existing_tool.name == tool.name:
+                self.tools[i] = tool
+                return
+        self.tools.append(tool)
+
+    def remove_tool(self, name: str):
+        """Remove a tool by its name."""
+        self.tools = [tool for tool in self.tools if tool.name != name]
+
+    def get_tool(self, name: str) -> Optional[FunctionTool]:
+        """Get a tool by its name."""
+        for tool in self.tools:
+            if tool.name == name:
+                return tool
+        return None
+
+    def openai_schema(self, omit_empty_parameters: bool = False) -> List[Dict]:
+        """Convert tools to OpenAI API function calling schema format."""
+        result = []
+        for tool in self.tools:
+            func_def = {
+                "type": "function",
+                "function": {
+                    "name": tool.name,
+                    "description": tool.description,
+                },
+            }
+
+            if tool.parameters.get("properties") or not omit_empty_parameters:
+                func_def["function"]["parameters"] = tool.parameters
+
+            result.append(func_def)
+        return result
+
+    def anthropic_schema(self) -> List[Dict]:
+        """Convert tools to Anthropic API format."""
+        result = []
+        for tool in self.tools:
+            tool_def = {
+                "name": tool.name,
+                "description": tool.description,
+                "input_schema": {
+                    "type": "object",
+                    "properties": tool.parameters.get("properties", {}),
+                    "required": tool.parameters.get("required", []),
+                },
+            }
+            result.append(tool_def)
+        return result
+
+    def google_schema(self) -> Dict:
+        """Convert tools to Google GenAI API format."""
+
+        def convert_schema(schema: dict) -> dict:
+            """Convert schema to Gemini API format."""
+            supported_types = {
+                "string",
+                "number",
+                "integer",
+                "boolean",
+                "array",
+                "object",
+                "null",
+            }
+            supported_formats = {
+                "string": {"enum", "date-time"},
+                "integer": {"int32", "int64"},
+                "number": {"float", "double"},
+            }
+
+            if "anyOf" in schema:
+                return {"anyOf": [convert_schema(s) for s in schema["anyOf"]]}
+
+            result = {}
+
+            if "type" in schema and schema["type"] in supported_types:
+                result["type"] = schema["type"]
+                if "format" in schema and schema["format"] in supported_formats.get(
+                    result["type"], set()
+                ):
+                    result["format"] = schema["format"]
             else:
-                return await self.mcp_client.session.call_tool(self.name, args)
+                result["type"] = "null"
+
+            support_fields = {
+                "title",
+                "description",
+                "enum",
+                "minimum",
+                "maximum",
+                "maxItems",
+                "minItems",
+                "nullable",
+                "required",
+            }
+            result.update({k: schema[k] for k in support_fields if k in schema})
+
+            if "properties" in schema:
+                properties = {}
+                for key, value in schema["properties"].items():
+                    prop_value = convert_schema(value)
+                    if "default" in prop_value:
+                        del prop_value["default"]
+                    properties[key] = prop_value
+
+                if properties:
+                    result["properties"] = properties
+
+            if "items" in schema:
+                result["items"] = convert_schema(schema["items"])
+
+            return result
+
+        tools = [
+            {
+                "name": tool.name,
+                "description": tool.description,
+                "parameters": convert_schema(tool.parameters),
+            }
+            for tool in self.tools
+        ]
+
+        declarations = {}
+        if tools:
+            declarations["function_declarations"] = tools
+        return declarations
+
+    def __len__(self):
+        return len(self.tools)
+
+    def __bool__(self):
+        return len(self.tools) > 0
+
+    def __iter__(self):
+        return iter(self.tools)
+
+
+class FunctionToolExecutor:
+    """A class for executing function tools."""
+
+    def __init__(self, tool: FunctionTool):
+        """Initialize the FunctionToolExecutor."""
+        self.tool = tool
+
+    async def _execute_local_tool(self, **kwargs) -> Any:
+        """Execute a local tool."""
+        if not self.tool.handler:
+            raise Exception(f"Local function {self.tool.name} has no handler")
+        return await self.tool.handler(**kwargs)
+
+    async def _execute_mcp_tool(self, **kwargs) -> Any:
+        """Execute a MCP tool."""
+        if not self.tool.mcp_client or not self.tool.mcp_client.session:
+            raise Exception(f"MCP client for {self.tool.name} is not available")
+        actual_tool_name = (
+            self.tool.name.split(":")[-1] if ":" in self.tool.name else self.tool.name
+        )
+        return await self.tool.mcp_client.session.call_tool(actual_tool_name, kwargs)
+
+    async def execute(self, **kwargs) -> Any:
+        if self.tool.origin == "local":
+            return await self._execute_local_tool(**kwargs)
+        elif self.tool.origin == "mcp":
+            return await self._execute_mcp_tool(**kwargs)
         else:
-            raise Exception(f"Unknown function origin: {self.origin}")
+            raise Exception(f"Unknown function origin: {self.tool.origin}")
 
 
 class MCPClient:
@@ -195,7 +359,7 @@ class MCPClient:
         await self.exit_stack.aclose()
 
 
-class FuncCall:
+class FunctionToolManager:
     def __init__(self) -> None:
         self.func_list: List[FuncTool] = []
         """内部加载的 func tools"""
@@ -429,132 +593,25 @@ class FuncCall:
         """
         获得 OpenAI API 风格的**已经激活**的工具描述
         """
-        _l = []
-        # 处理所有工具（包括本地和MCP工具）
-        for f in self.func_list:
-            if not f.active:
-                continue
-            func_ = {
-                "type": "function",
-                "function": {
-                    "name": f.name,
-                    # "parameters": f.parameters,
-                    "description": f.description,
-                },
-            }
-            func_["function"]["parameters"] = f.parameters
-            if not f.parameters.get("properties") and omit_empty_parameter_field:
-                # 如果 properties 为空，并且 omit_empty_parameter_field 为 True，则删除 parameters 字段
-                del func_["function"]["parameters"]
-            _l.append(func_)
-        return _l
+        tools = [f for f in self.func_list if f.active]
+        toolset = ToolSet(tools)
+        return toolset.openai_schema(omit_empty_parameters=omit_empty_parameter_field)
 
     def get_func_desc_anthropic_style(self) -> list:
         """
         获得 Anthropic API 风格的**已经激活**的工具描述
         """
-        tools = []
-        for f in self.func_list:
-            if not f.active:
-                continue
-
-            # Convert internal format to Anthropic style
-            tool = {
-                "name": f.name,
-                "description": f.description,
-                "input_schema": {
-                    "type": "object",
-                    "properties": f.parameters.get("properties", {}),
-                    # Keep the required field from the original parameters if it exists
-                    "required": f.parameters.get("required", []),
-                },
-            }
-            tools.append(tool)
-        return tools
+        tools = [f for f in self.func_list if f.active]
+        toolset = ToolSet(tools)
+        return toolset.anthropic_schema()
 
     def get_func_desc_google_genai_style(self) -> dict:
         """
         获得 Google GenAI API 风格的**已经激活**的工具描述
         """
-
-        # Gemini API 支持的数据类型和格式
-        supported_types = {
-            "string",
-            "number",
-            "integer",
-            "boolean",
-            "array",
-            "object",
-            "null",
-        }
-        supported_formats = {
-            "string": {"enum", "date-time"},
-            "integer": {"int32", "int64"},
-            "number": {"float", "double"},
-        }
-
-        def convert_schema(schema: dict) -> dict:
-            """转换 schema 为 Gemini API 格式"""
-
-            # 如果 schema 包含 anyOf，则只返回 anyOf 字段
-            if "anyOf" in schema:
-                return {"anyOf": [convert_schema(s) for s in schema["anyOf"]]}
-
-            result = {}
-
-            if "type" in schema and schema["type"] in supported_types:
-                result["type"] = schema["type"]
-                if "format" in schema and schema["format"] in supported_formats.get(
-                    result["type"], set()
-                ):
-                    result["format"] = schema["format"]
-            else:
-                # 暂时指定默认为null
-                result["type"] = "null"
-
-            support_fields = {
-                "title",
-                "description",
-                "enum",
-                "minimum",
-                "maximum",
-                "maxItems",
-                "minItems",
-                "nullable",
-                "required",
-            }
-            result.update({k: schema[k] for k in support_fields if k in schema})
-
-            if "properties" in schema:
-                properties = {}
-                for key, value in schema["properties"].items():
-                    prop_value = convert_schema(value)
-                    if "default" in prop_value:
-                        del prop_value["default"]
-                    properties[key] = prop_value
-
-                if properties:  # 只在有非空属性时添加
-                    result["properties"] = properties
-
-            if "items" in schema:
-                result["items"] = convert_schema(schema["items"])
-
-            return result
-
-        tools = [
-            {
-                "name": f.name,
-                "description": f.description,
-                **({"parameters": convert_schema(f.parameters)}),
-            }
-            for f in self.func_list
-            if f.active
-        ]
-
-        declarations = {}
-        if tools:
-            declarations["function_declarations"] = tools
-        return declarations
+        tools = [f for f in self.func_list if f.active]
+        toolset = ToolSet(tools)
+        return toolset.google_schema()
 
     async def func_call(self, question: str, session_id: str, provider) -> tuple:
         _l = []
@@ -634,3 +691,7 @@ class FuncCall:
         for name in self.mcp_client_dict.keys():
             await self._terminate_mcp_client(name)
             logger.debug(f"清理 MCP 客户端 {name} 资源")
+
+
+# alias for FunctionToolManager
+FuncCall = FunctionToolManager
